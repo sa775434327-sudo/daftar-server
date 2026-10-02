@@ -20,6 +20,7 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+SETUP_KEY = os.getenv("SETUP_KEY")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL غير موجود")
@@ -73,11 +74,7 @@ def hash_password(password: str) -> str:
         200000
     )
 
-    return (
-        salt.hex()
-        + ":"
-        + password_hash.hex()
-    )
+    return salt.hex() + ":" + password_hash.hex()
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
@@ -111,6 +108,12 @@ class CreateUserRequest(BaseModel):
     username: str
     password: str
     role: str = "user"
+
+
+class ResetManagerRequest(BaseModel):
+    setup_key: str
+    username: str
+    password: str
 
 
 def get_current_user(
@@ -251,6 +254,62 @@ def setup_manager(data: LoginRequest):
                 "id": user.id,
                 "username": user.username,
                 "role": user.role
+            }
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/reset-manager")
+def reset_manager(data: ResetManagerRequest):
+    if not SETUP_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="SETUP_KEY غير مضبوط في الخادم"
+        )
+
+    if not secrets.compare_digest(
+        data.setup_key,
+        SETUP_KEY
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="مفتاح الإعداد غير صحيح"
+        )
+
+    db = SessionLocal()
+
+    try:
+        manager = (
+            db.query(User)
+            .filter(User.role == "manager")
+            .first()
+        )
+
+        if not manager:
+            raise HTTPException(
+                status_code=404,
+                detail="حساب المدير غير موجود"
+            )
+
+        manager.username = data.username
+        manager.password_hash = hash_password(data.password)
+        manager.is_active = True
+
+        db.query(Session).filter(
+            Session.user_id == manager.id
+        ).delete()
+
+        db.commit()
+
+        return {
+            "status": "ok",
+            "message": "تم تحديث حساب المدير",
+            "user": {
+                "id": manager.id,
+                "username": manager.username,
+                "role": manager.role
             }
         }
 
