@@ -1,13 +1,13 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
-from datetime import datetime, timezone
+from datetime import datetime
 import os
 import hashlib
 import secrets
-
 
 app = FastAPI(title="Daftar Server")
 
@@ -19,64 +19,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# =========================
-# Database
-# =========================
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not configured")
+    raise RuntimeError("DATABASE_URL غير موجود")
 
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,
+    pool_pre_ping=True
 )
 
 SessionLocal = sessionmaker(
-    bind=engine,
     autocommit=False,
     autoflush=False,
+    bind=engine
 )
 
 Base = declarative_base()
 
+security = HTTPBearer()
 
-# =========================
-# Users table
-# =========================
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(100), unique=True, nullable=False, index=True)
-    password_hash = Column(String(300), nullable=False)
-    role = Column(String(20), nullable=False, default="user")
-    is_active = Column(Boolean, nullable=False, default=True)
-    created_at = Column(DateTime(timezone=True), nullable=False)
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, default="user", nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-
-# =========================
-# Sessions table
-# =========================
 
 class Session(Base):
     __tablename__ = "sessions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, index=True)
-    token = Column(String(200), unique=True, nullable=False, index=True)
-    created_at = Column(DateTime(timezone=True), nullable=False)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False)
+    token = Column(String, unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
 
-
-# =========================
-# Password functions
-# =========================
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
@@ -85,45 +70,37 @@ def hash_password(password: str) -> str:
         "sha256",
         password.encode("utf-8"),
         salt,
-        200000,
+        200000
     )
 
     return (
-        "pbkdf2_sha256$200000$"
-        + salt.hex()
-        + "$"
+        salt.hex()
+        + ":"
         + password_hash.hex()
     )
 
 
 def verify_password(password: str, stored_hash: str) -> bool:
     try:
-        algorithm, iterations, salt_hex, hash_hex = stored_hash.split("$")
-
-        if algorithm != "pbkdf2_sha256":
-            return False
+        salt_hex, hash_hex = stored_hash.split(":")
 
         salt = bytes.fromhex(salt_hex)
 
-        calculated = hashlib.pbkdf2_hmac(
+        password_hash = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
             salt,
-            int(iterations),
+            200000
         )
 
         return secrets.compare_digest(
-            calculated.hex(),
-            hash_hex,
+            password_hash.hex(),
+            hash_hex
         )
 
     except Exception:
         return False
 
-
-# =========================
-# Request models
-# =========================
 
 class LoginRequest(BaseModel):
     username: str
@@ -136,9 +113,43 @@ class CreateUserRequest(BaseModel):
     role: str = "user"
 
 
-# =========================
-# Basic endpoints
-# =========================
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+
+    db = SessionLocal()
+
+    try:
+        session = (
+            db.query(Session)
+            .filter(Session.token == token)
+            .first()
+        )
+
+        if not session:
+            raise HTTPException(
+                status_code=401,
+                detail="رمز الدخول غير صالح"
+            )
+
+        user = (
+            db.query(User)
+            .filter(User.id == session.user_id)
+            .first()
+        )
+
+        if not user or not user.is_active:
+            raise HTTPException(
+                status_code=401,
+                detail="المستخدم غير صالح أو غير نشط"
+            )
+
+        return user
+
+    finally:
+        db.close()
+
 
 @app.get("/")
 def root():
@@ -155,13 +166,8 @@ def health():
     }
 
 
-# =========================
-# Login
-# =========================
-
 @app.post("/login")
 def login(data: LoginRequest):
-
     db = SessionLocal()
 
     try:
@@ -171,16 +177,10 @@ def login(data: LoginRequest):
             .first()
         )
 
-        if user is None:
+        if not user or not user.is_active:
             raise HTTPException(
                 status_code=401,
                 detail="اسم المستخدم أو كلمة المرور غير صحيحة"
-            )
-
-        if not user.is_active:
-            raise HTTPException(
-                status_code=403,
-                detail="الحساب غير مفعل"
             )
 
         if not verify_password(
@@ -196,8 +196,7 @@ def login(data: LoginRequest):
 
         new_session = Session(
             user_id=user.id,
-            token=token,
-            created_at=datetime.now(timezone.utc),
+            token=token
         )
 
         db.add(new_session)
@@ -209,7 +208,7 @@ def login(data: LoginRequest):
             "user": {
                 "id": user.id,
                 "username": user.username,
-                "role": user.role,
+                "role": user.role
             }
         }
 
@@ -217,13 +216,8 @@ def login(data: LoginRequest):
         db.close()
 
 
-# =========================
-# Create first manager
-# =========================
-
 @app.post("/setup-manager")
-def setup_manager(data: CreateUserRequest):
-
+def setup_manager(data: LoginRequest):
     db = SessionLocal()
 
     try:
@@ -235,109 +229,15 @@ def setup_manager(data: CreateUserRequest):
 
         if existing_manager:
             raise HTTPException(
-                status_code=409,
-                detail="تم إنشاء المدير مسبقًا"
-            )
-
-        existing_user = (
-            db.query(User)
-            .filter(User.username == data.username)
-            .first()
-        )
-
-        if existing_user:
-            raise HTTPException(
-                status_code=409,
-                detail="اسم المستخدم موجود مسبقًا"
-            )
-
-        manager = User(
-            username=data.username,
-            password_hash=hash_password(data.password),
-            role="manager",
-            is_active=True,
-            created_at=datetime.now(timezone.utc),
-        )
-
-        db.add(manager)
-        db.commit()
-        db.refresh(manager)
-
-        return {
-            "status": "ok",
-            "message": "تم إنشاء حساب المدير",
-            "user": {
-                "id": manager.id,
-                "username": manager.username,
-                "role": manager.role,
-            }
-        }
-
-    finally:
-        db.close()
-
-
-# =========================
-# Create user
-# =========================
-
-@app.post("/users")
-def create_user(
-    data: CreateUserRequest,
-    token: str
-):
-
-    db = SessionLocal()
-
-    try:
-        session = (
-            db.query(Session)
-            .filter(Session.token == token)
-            .first()
-        )
-
-        if session is None:
-            raise HTTPException(
-                status_code=401,
-                detail="جلسة الدخول غير صحيحة"
-            )
-
-        manager = (
-            db.query(User)
-            .filter(User.id == session.user_id)
-            .first()
-        )
-
-        if manager is None or manager.role != "manager":
-            raise HTTPException(
-                status_code=403,
-                detail="هذه العملية للمدير فقط"
-            )
-
-        if data.role not in ["user", "manager"]:
-            raise HTTPException(
                 status_code=400,
-                detail="الدور غير صحيح"
-            )
-
-        existing = (
-            db.query(User)
-            .filter(User.username == data.username)
-            .first()
-        )
-
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail="اسم المستخدم موجود مسبقًا"
+                detail="حساب المدير موجود بالفعل"
             )
 
         user = User(
             username=data.username,
             password_hash=hash_password(data.password),
-            role=data.role,
-            is_active=True,
-            created_at=datetime.now(timezone.utc),
+            role="manager",
+            is_active=True
         )
 
         db.add(user)
@@ -346,10 +246,70 @@ def create_user(
 
         return {
             "status": "ok",
+            "message": "تم إنشاء حساب المدير",
             "user": {
                 "id": user.id,
                 "username": user.username,
-                "role": user.role,
+                "role": user.role
+            }
+        }
+
+    finally:
+        db.close()
+
+
+@app.post("/users")
+def create_user(
+    data: CreateUserRequest,
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "manager":
+        raise HTTPException(
+            status_code=403,
+            detail="ليس لديك صلاحية إنشاء المستخدمين"
+        )
+
+    db = SessionLocal()
+
+    try:
+        existing_user = (
+            db.query(User)
+            .filter(User.username == data.username)
+            .first()
+        )
+
+        if existing_user:
+            raise HTTPException(
+                status_code=400,
+                detail="اسم المستخدم موجود بالفعل"
+            )
+
+        role = data.role
+
+        if role not in ["user", "manager"]:
+            raise HTTPException(
+                status_code=400,
+                detail="الدور غير صالح"
+            )
+
+        user = User(
+            username=data.username,
+            password_hash=hash_password(data.password),
+            role=role,
+            is_active=True
+        )
+
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        return {
+            "status": "ok",
+            "message": "تم إنشاء المستخدم",
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "role": user.role
             }
         }
 
